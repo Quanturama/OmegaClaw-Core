@@ -98,67 +98,42 @@ def tavily_search(search_query: str, timeout: int = 60) -> str:
 
 # ── PHEME market intelligence ─────────────────────────────────────────────────
 
+from uagents_adapter.mcp import CallTool, CallToolResponse
+
+PHEME_AGENT_ADDRESS = os.environ.get(
+    "PHEME_AGENT_ADDRESS",
+    "agent1q0nwgquytzxrrhsplpq4zt5f25avuk385027vdzvjsyupprgmcrrg6vj8q6",
+)
+
+
 class PhemeBlockedError(Exception):
-    """Raised when PHEME MCP returns a blocked signal (pipeline down or expired)."""
+    """Raised when PHEME returns a blocked signal (pipeline down or signal expired)."""
     pass
 
 
-def _call_pheme_mcp(skill_name: str, parameters: dict) -> str:
-    """Call a PHEME MCP skill via direct HTTP session.
+def _call_pheme(skill_name: str, parameters: dict, timeout: int = 60) -> str:
+    """Send a CallTool request to the PHEME Agentverse agent via mcp_proto.
 
-    Direct HTTP call — NOT an Agentverse uAgent hop. Latency: low single-digit seconds.
-    Network path: PHEME_MCP_URL env var (set if OmegaClaw runs outside pheme-mcp's Docker
-    network) or http://localhost:8000 default (same host / same Docker network).
+    Same send pattern as tavily_search / technical_analysis — uAgent hop via
+    Agentverse mailbox. Round-trip latency: 30–60s typical.
+    Raises PhemeBlockedError if the response contains a blocked signal.
     """
-    import urllib.request
-    import urllib.error
-    import json as _json
+    request = CallTool(tool=skill_name, args=parameters)
+    response_raw = asyncio.run(_ask_agent(PHEME_AGENT_ADDRESS, request, timeout))
 
-    base_url = os.environ.get("PHEME_MCP_URL", "http://localhost:8000/mcp")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    timeout = 10
+    try:
+        resp = CallToolResponse.model_validate_json(response_raw)
+        text = resp.result or ""
+    except Exception:
+        text = str(response_raw)
 
-    def _post(payload: dict, extra_headers: dict = {}) -> tuple[dict, dict]:
-        data = _json.dumps(payload).encode()
-        req = urllib.request.Request(base_url, data=data,
-                                     headers={**headers, **extra_headers},
-                                     method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_headers = dict(resp.headers)
-            body = resp.read().decode()
-            # SSE response: extract data: line
-            for line in body.splitlines():
-                if line.startswith("data: "):
-                    return _json.loads(line[6:]), resp_headers
-        raise ValueError("No data line in SSE response")
-
-    # 1. Initialize session
-    _, init_headers = _post({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                   "clientInfo": {"name": "omegaclaw", "version": "1.0"}}
-    })
-    session_id = init_headers.get("mcp-session-id") or init_headers.get("Mcp-Session-Id", "")
-
-    # 2. Call the tool
-    result, _ = _post({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": skill_name, "arguments": parameters}
-    }, extra_headers={"mcp-session-id": session_id})
-
-    text = result.get("result", {}).get("content", [{}])[0].get("text", "")
-
-    # 3. Check for blocked status
     if "blocked" in text.lower():
         try:
-            parsed = _json.loads(text)
+            parsed = json.loads(text)
             if parsed.get("status") == "blocked":
                 raise PhemeBlockedError(parsed.get("reason", "signal blocked"))
-        except (_json.JSONDecodeError, AttributeError):
-            pass  # text contains "blocked" as a word but isn't a blocked JSON response
+        except (json.JSONDecodeError, AttributeError):
+            pass
 
     return text
 
@@ -171,23 +146,22 @@ def pheme_query(arg: str, format: str = "telegram") -> str:
     Future: wire arg to a coin/topic filter.
 
     Falls back to pheme_macro_analysis (regime + verdict, no prices/headlines) if
-    pheme_market_brief is blocked or unavailable.
+    pheme_market_brief is blocked or the Agentverse hop fails.
     """
     try:
-        result = _call_pheme_mcp("pheme_market_brief", {"format": "text"})
+        result = _call_pheme("pheme_market_brief", {"format": "text"})
         if format == "irc":
             # Flatten for IRC single-line output — not in demo critical path (demo is Telegram)
             result = " | ".join(line.strip() for line in result.splitlines() if line.strip())
         return result
     except PhemeBlockedError:
-        # PHEME pipeline returned a blocked signal — fall through to simpler fallback.
-        # Logged separately from generic Exception so demo-day debugging can distinguish
-        # "PHEME pipeline down" from "network/timeout failure".
+        # Pipeline returned a blocked signal — distinguishable from network failure for
+        # demo-day diagnosis.
         pass
     except Exception:
         pass
-    # Fallback — proven live, covers regime read without prices/headlines
+    # Fallback — covers regime read without prices/headlines
     try:
-        return _call_pheme_mcp("pheme_macro_analysis", {"format": "text"})
+        return _call_pheme("pheme_macro_analysis", {"format": "text"})
     except Exception as e:
         return f"PHEME unavailable: {e}"
