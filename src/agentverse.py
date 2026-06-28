@@ -118,22 +118,62 @@ class PhemeBlockedError(Exception):
     pass
 
 
-def _call_pheme_direct(skill_name: str, parameters: dict, timeout: int = 15) -> str:
-    """Fallback: call PHEME MCP tool directly via HTTPS JSON-RPC."""
-    payload = json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": skill_name, "arguments": parameters},
-    }).encode()
+_MCP_ACCEPT = "application/json, text/event-stream"
+
+
+def _parse_mcp_body(raw: str) -> dict:
+    """MCP streamable-HTTP returns either JSON or SSE-framed JSON.
+    SSE frames look like: 'event: message\\r\\ndata: {...}\\r\\n\\r\\n'.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            return json.loads(line[len("data:"):].strip())
+    return json.loads(raw)
+
+
+def _mcp_post(payload: dict, session_id: str = None, timeout: int = 15):
+    headers = {"Content-Type": "application/json", "Accept": _MCP_ACCEPT}
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
     req = urllib.request.Request(
-        PHEME_MCP_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        PHEME_MCP_URL, data=json.dumps(payload).encode(), headers=headers, method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read().decode())
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    body = resp.read().decode()
+    new_sid = resp.headers.get("Mcp-Session-Id")
+    return _parse_mcp_body(body), new_sid
+
+
+def _call_pheme_direct(skill_name: str, parameters: dict, timeout: int = 15) -> str:
+    """Fallback: call PHEME MCP tool via HTTPS using the MCP streamable-HTTP handshake.
+    1) initialize -> obtain session id  2) notifications/initialized  3) tools/call.
+    """
+    # 1) initialize
+    _, session_id = _mcp_post({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "omegaclaw", "version": "1.0"},
+        },
+    }, timeout=timeout)
+
+    # 2) initialized notification (no response expected)
+    try:
+        _mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id, timeout)
+    except Exception:
+        pass
+
+    # 3) tools/call
+    result, _ = _mcp_post({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": skill_name, "arguments": parameters},
+    }, session_id, timeout)
+
     content = result.get("result", {}).get("content", [])
     text = " ".join(c.get("text", "") for c in content if c.get("type") == "text").strip()
     if not text:
