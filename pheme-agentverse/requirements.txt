@@ -1,0 +1,2 @@
+uagents-adapter>=0.6.2
+mcp[cli]>=1.0.0
