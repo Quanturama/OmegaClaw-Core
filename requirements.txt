@@ -3,6 +3,8 @@ chromadb==1.5.9
 janus-swi==1.5.2
 openai==2.38.0
 uagents==0.25.1
+uagents-adapter>=0.6.2
+mcp[cli]>=1.0.0
 transformers==5.8.0
 sentence-transformers==5.5.1
 import-kb==0.1.8
