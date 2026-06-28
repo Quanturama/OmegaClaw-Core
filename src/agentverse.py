@@ -220,7 +220,13 @@ def _call_pheme_agent(skill_name: str, parameters: dict, timeout: int = 45) -> s
         raise TimeoutError("uAgent bridge timed out")
 
     text = result_holder[0]
-    if "blocked" in text.lower():
+    # Detect Agentverse delivery failure / invalid sync response — treat as bridge
+    # failure so pheme_query falls through to the HTTPS path.
+    low = text.lower()
+    if ("deliverystatus.failed" in low or "delivery failed" in low
+            or "invalid sync response" in low or text.strip() == ""):
+        raise RuntimeError(f"uAgent bridge delivery failed: {text[:120]}")
+    if "blocked" in low:
         try:
             parsed = json.loads(text)
             if parsed.get("status") == "blocked":
