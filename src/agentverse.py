@@ -97,12 +97,14 @@ def tavily_search(search_query: str, timeout: int = 60) -> str:
 
 
 # ── PHEME market intelligence ─────────────────────────────────────────────────
+# Direct HTTPS call to mcp.quanturama.com — bypasses uAgents/Agentverse relay.
+# MCP HTTP transport: POST /mcp with JSON-RPC 2.0 body.
 
-from uagents_adapter.mcp import CallTool, CallToolResponse
+import urllib.request
 
-PHEME_AGENT_ADDRESS = os.environ.get(
-    "PHEME_AGENT_ADDRESS",
-    "agent1q0nwgquytzxrrhsplpq4zt5f25avuk385027vdzvjsyupprgmcrrg6vj8q6",
+PHEME_MCP_URL = os.environ.get(
+    "PHEME_MCP_URL",
+    "https://mcp.quanturama.com/mcp",
 )
 
 
@@ -111,21 +113,33 @@ class PhemeBlockedError(Exception):
     pass
 
 
-def _call_pheme(skill_name: str, parameters: dict, timeout: int = 60) -> str:
-    """Send a CallTool request to the PHEME Agentverse agent via mcp_proto.
+def _call_pheme(skill_name: str, parameters: dict, timeout: int = 30) -> str:
+    """Call a PHEME MCP tool directly via HTTPS JSON-RPC."""
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": skill_name,
+            "arguments": parameters,
+        },
+    }).encode()
 
-    Same send pattern as tavily_search / technical_analysis — uAgent hop via
-    Agentverse mailbox. Round-trip latency: 30–60s typical.
-    Raises PhemeBlockedError if the response contains a blocked signal.
-    """
-    request = CallTool(tool=skill_name, args=parameters)
-    response_raw = asyncio.run(_ask_agent(PHEME_AGENT_ADDRESS, request, timeout))
+    req = urllib.request.Request(
+        PHEME_MCP_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        result = json.loads(resp.read().decode())
 
-    try:
-        resp = CallToolResponse.model_validate_json(response_raw)
-        text = resp.result or ""
-    except Exception:
-        text = str(response_raw)
+    # MCP response: {"result": {"content": [{"type": "text", "text": "..."}]}}
+    content = result.get("result", {}).get("content", [])
+    text = " ".join(c.get("text", "") for c in content if c.get("type") == "text").strip()
+
+    if not text:
+        text = json.dumps(result)
 
     if "blocked" in text.lower():
         try:
@@ -139,28 +153,13 @@ def _call_pheme(skill_name: str, parameters: dict, timeout: int = 60) -> str:
 
 
 def pheme_query(arg: str, format: str = "telegram") -> str:
-    """Get a full PHEME crypto market brief (regime, prices, sentiment, top headlines).
-
-    arg satisfies the MeTTa calling convention (pheme-query $arg) but is intentionally
-    unused — pheme_market_brief returns a fixed full brief, not a query-specific response.
-    Future: wire arg to a coin/topic filter.
-
-    Falls back to pheme_macro_analysis (regime + verdict, no prices/headlines) if
-    pheme_market_brief is blocked or the Agentverse hop fails.
-    """
+    """Get a full PHEME crypto market brief (regime, prices, sentiment, top headlines)."""
     try:
-        result = _call_pheme("pheme_market_brief", {"format": "text"})
-        if format == "irc":
-            # Flatten for IRC single-line output — not in demo critical path (demo is Telegram)
-            result = " | ".join(line.strip() for line in result.splitlines() if line.strip())
-        return result
+        return _call_pheme("pheme_market_brief", {"format": "text"})
     except PhemeBlockedError:
-        # Pipeline returned a blocked signal — distinguishable from network failure for
-        # demo-day diagnosis.
         pass
     except Exception:
         pass
-    # Fallback — covers regime read without prices/headlines
     try:
         return _call_pheme("pheme_macro_analysis", {"format": "text"})
     except Exception as e:
