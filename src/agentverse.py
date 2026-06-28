@@ -97,11 +97,17 @@ def tavily_search(search_query: str, timeout: int = 60) -> str:
 
 
 # ── PHEME market intelligence ─────────────────────────────────────────────────
-# Direct HTTPS call to mcp.quanturama.com — bypasses uAgents/Agentverse relay.
-# MCP HTTP transport: POST /mcp with JSON-RPC 2.0 body.
+# Two-path design:
+#   Primary:  uAgent bridge via Agentverse (BGI demo path — correct architecture)
+#   Fallback: Direct HTTPS to mcp.quanturama.com (if relay times out)
 
 import urllib.request
+import threading
 
+PHEME_AGENT_ADDRESS = os.environ.get(
+    "PHEME_AGENT_ADDRESS",
+    "agent1q0nwgquytzxrrhsplpq4zt5f25avuk385027vdzvjsyupprgmcrrg6vj8q6",
+)
 PHEME_MCP_URL = os.environ.get(
     "PHEME_MCP_URL",
     "https://mcp.quanturama.com/mcp",
@@ -109,22 +115,17 @@ PHEME_MCP_URL = os.environ.get(
 
 
 class PhemeBlockedError(Exception):
-    """Raised when PHEME returns a blocked signal (pipeline down or signal expired)."""
     pass
 
 
-def _call_pheme(skill_name: str, parameters: dict, timeout: int = 30) -> str:
-    """Call a PHEME MCP tool directly via HTTPS JSON-RPC."""
+def _call_pheme_direct(skill_name: str, parameters: dict, timeout: int = 15) -> str:
+    """Fallback: call PHEME MCP tool directly via HTTPS JSON-RPC."""
     payload = json.dumps({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {
-            "name": skill_name,
-            "arguments": parameters,
-        },
+        "params": {"name": skill_name, "arguments": parameters},
     }).encode()
-
     req = urllib.request.Request(
         PHEME_MCP_URL,
         data=payload,
@@ -133,14 +134,10 @@ def _call_pheme(skill_name: str, parameters: dict, timeout: int = 30) -> str:
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read().decode())
-
-    # MCP response: {"result": {"content": [{"type": "text", "text": "..."}]}}
     content = result.get("result", {}).get("content", [])
     text = " ".join(c.get("text", "") for c in content if c.get("type") == "text").strip()
-
     if not text:
         text = json.dumps(result)
-
     if "blocked" in text.lower():
         try:
             parsed = json.loads(text)
@@ -148,19 +145,72 @@ def _call_pheme(skill_name: str, parameters: dict, timeout: int = 30) -> str:
                 raise PhemeBlockedError(parsed.get("reason", "signal blocked"))
         except (json.JSONDecodeError, AttributeError):
             pass
+    return text
 
+
+def _call_pheme_agent(skill_name: str, parameters: dict, timeout: int = 45) -> str:
+    """Primary: call PHEME via uAgent bridge (BGI Agentverse path).
+    Runs asyncio.run() in a dedicated thread to avoid event-loop conflicts
+    with OmegaClaw's MeTTa py-call runtime.
+    """
+    from uagents_adapter.mcp import CallTool, CallToolResponse
+
+    result_holder = [None]
+    error_holder = [None]
+
+    def _run():
+        try:
+            request = CallTool(tool=skill_name, args=parameters)
+            raw = asyncio.run(_ask_agent(PHEME_AGENT_ADDRESS, request, timeout))
+            try:
+                resp = CallToolResponse.model_validate_json(raw)
+                result_holder[0] = resp.result or ""
+            except Exception:
+                result_holder[0] = str(raw)
+        except Exception as e:
+            error_holder[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout + 5)
+
+    if error_holder[0]:
+        raise error_holder[0]
+    if result_holder[0] is None:
+        raise TimeoutError("uAgent bridge timed out")
+
+    text = result_holder[0]
+    if "blocked" in text.lower():
+        try:
+            parsed = json.loads(text)
+            if parsed.get("status") == "blocked":
+                raise PhemeBlockedError(parsed.get("reason", "signal blocked"))
+        except (json.JSONDecodeError, AttributeError):
+            pass
     return text
 
 
 def pheme_query(arg: str, format: str = "telegram") -> str:
-    """Get a full PHEME crypto market brief (regime, prices, sentiment, top headlines)."""
+    """Get a full PHEME crypto market brief.
+    Tries uAgent bridge first (BGI demo path), falls back to direct HTTPS.
+    """
+    # Primary: uAgent → Agentverse → PHEME agent
     try:
-        return _call_pheme("pheme_market_brief", {"format": "text"})
+        return _call_pheme_agent("pheme_market_brief", {"format": "text"})
     except PhemeBlockedError:
         pass
     except Exception:
         pass
+
+    # Fallback: direct HTTPS to mcp.quanturama.com
     try:
-        return _call_pheme("pheme_macro_analysis", {"format": "text"})
+        return _call_pheme_direct("pheme_market_brief", {"format": "text"})
+    except PhemeBlockedError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        return _call_pheme_direct("pheme_macro_analysis", {"format": "text"})
     except Exception as e:
         return f"PHEME unavailable: {e}"
