@@ -139,14 +139,15 @@ class AsiOneProvider(AIProvider):
                 messages=[{"role": "system", "content": sysmsg},
                           {"role": "user", "content": usermsg}],
                 max_tokens=max_tokens,
-                extra_body={
-                    "enable_thinking": True,
-                    "thinking_budget": 6000 
-                },
                 **kwargs
             )
 
-            raw = response.choices[0].message.content
+            msg = response.choices[0].message
+            raw = msg.content
+            # asi1-mini in thinking mode returns content=None with reasoning_content set;
+            # fall back to reasoning_content so we never lose the response.
+            if not raw:
+                raw = getattr(msg, "reasoning_content", None) or ""
             _log_raw(self._name, self._model_name, raw)
             resp = self._clean_text(raw)
             resp = resp.replace("</arg_value>", " ").replace("</tool_call>", " ").replace("<arg_value>", " ").replace("<tool_call>", " ")
