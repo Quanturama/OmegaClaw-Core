@@ -9,15 +9,15 @@
 (= (spamShield) (empty))
 
 (= (initLoop)
-   (progn (configure maxNewInputLoops 50) ;20
+   (progn (configure maxNewInputLoops 12) ;capped for cost — was 50
           (configure maxWakeLoops 1)
           (configure spamShield True)
-          (configure sleepInterval 1) ;10
+          (configure sleepInterval 2) ;slower idle poll — was 1
           (configure LLM gpt-5.4)
           (configure provider Anthropic) ;Anthropic or OpenAI or ASICloud or ASIOne or Test
           (configure maxOutputToken 6000)
           (configure reasoningMode medium)
-          (configure wakeupInterval 600) ;600=10 minutes
+          (configure wakeupInterval 3600) ;1h between idle wake-ups — was 600 (10m)
           (change-state! &prevmsg "")
           (change-state! &lastresults "")
           (change-state! &loops (maxNewInputLoops))))
